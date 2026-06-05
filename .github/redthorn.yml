@@ -1,0 +1,100 @@
+# RedThorn Security Scan — Example GitHub Actions Workflow
+# ─────────────────────────────────────────────────────────
+# This workflow runs a RedThorn security scan on every push and pull request.
+#
+# Required repository secrets:
+#   REDTHORN_DASHBOARD_URL  — URL of your RedThorn Dashboard (e.g. https://api.redthorn.io)
+#   REDTHORN_API_KEY        — API key for Dashboard upload
+#
+# Optional variables:
+#   REDTHORN_AI_MODE        — AI mode: triage, lightweight, deep (default: deep)
+#   REDTHORN_FAIL_ON        — Fail threshold: critical, high, medium, low (default: critical)
+#   REDTHORN_SKIP_TOOLS     — Comma-separated tools to skip (e.g. "trivy,actionlint")
+
+name: RedThorn Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install RedThorn + tools
+        run: |
+          curl -fsSL https://redthorn.io/install.sh | bash
+          echo "$HOME/.redthorn/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run RedThorn scan
+        id: scan
+        env:
+          REDTHORN_DASHBOARD_URL: ${{ secrets.REDTHORN_DASHBOARD_URL }}
+          REDTHORN_API_KEY: ${{ secrets.REDTHORN_API_KEY }}
+        run: |
+          set +e
+          redthorn scan . \
+            --ci \
+            --ai --ai-mode deep \
+            --upload \
+            --dashboard-url "$REDTHORN_DASHBOARD_URL" \
+            --api-key "$REDTHORN_API_KEY" \
+            --fail-on critical \
+            -o json --output-file scan.json \
+            2>&1
+          echo "scan_exit=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Parse results
+        id: results
+        if: always()
+        run: |
+          if [ ! -f scan.json ]; then
+            echo "total=0" >> "$GITHUB_OUTPUT"
+            echo "critical=0" >> "$GITHUB_OUTPUT"
+            echo "high=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TOTAL=$(jq '[.findings // [] | length] | add // 0' scan.json)
+          CRITICAL=$(jq '[.findings // [] | .[] | select(.severity == "critical")] | length' scan.json)
+          HIGH=$(jq '[.findings // [] | .[] | select(.severity == "high")] | length' scan.json)
+          echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
+          echo "critical=${CRITICAL}" >> "$GITHUB_OUTPUT"
+          echo "high=${HIGH}" >> "$GITHUB_OUTPUT"
+          echo "### RedThorn Scan: ${TOTAL} findings (${CRITICAL} critical, ${HIGH} high)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redthorn-scan-results
+          path: scan.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Print results
+        if: always()
+        run: |
+          echo "Total findings: ${{ steps.results.outputs.total }}"
+          echo "Critical: ${{ steps.results.outputs.critical }}"
+          echo "High: ${{ steps.results.outputs.high }}"
